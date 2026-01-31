@@ -16,6 +16,9 @@ from pathlib import Path
 def load_data(excel_path: str) -> pd.DataFrame:
     """从 Excel 文件加载数据"""
     df = pd.read_excel(excel_path)
+    # Excel 中的除零错误（#DIV/0!）读入后为 NaN，inf 也需处理；统一置为 0
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    df[numeric_cols] = df[numeric_cols].fillna(0).replace([np.inf, -np.inf], 0)
     # 确保按时间排序
     df = df.sort_values('时间')
     df = df.reset_index(drop=True)
@@ -128,7 +131,8 @@ def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def generate_problem_prompt_trajectory(df: pd.DataFrame, start_idx: int, trajectory_length: int = 20, 
-                                       lookback_window: int = 60, price_scale: float = 1.0) -> str:
+                                       lookback_window: int = 60, price_scale: float = 1.0,
+                                       use_sentiment: bool = False) -> str:
     """
     生成轨迹级别的问题提示，包含多天的市场状态信息
     
@@ -138,6 +142,7 @@ def generate_problem_prompt_trajectory(df: pd.DataFrame, start_idx: int, traject
         trajectory_length: 轨迹长度（天数）
         lookback_window: 回看窗口大小（用于提供历史上下文）
         price_scale: 价格缩放因子（数据增广用）
+        use_sentiment: 是否在prompt中加入情绪指标
     """
     # 获取轨迹窗口的数据
     end_idx = start_idx + trajectory_length
@@ -165,12 +170,13 @@ def generate_problem_prompt_trajectory(df: pd.DataFrame, start_idx: int, traject
         volatility = row.get('volatility_60', 0.15)
         rsi = row.get('RSI_30', 50)
         macd = row.get('MACD_16_48', 0)
+        sent_1 = row.get('sent_1', 0.0)
         
         # 应用价格缩放增广
         price = row['结算价(元)'] * price_scale
         time = row['时间']
         
-        daily_states.append({
+        state = {
             'day': i + 1,
             'time': str(time),
             'price': float(price),
@@ -180,7 +186,12 @@ def generate_problem_prompt_trajectory(df: pd.DataFrame, start_idx: int, traject
             'norm_return_30': float(norm_return_30),
             'rsi': float(rsi),
             'macd': float(macd)
-        })
+        }
+        
+        if use_sentiment:
+            state['sent_1'] = float(sent_1)
+            
+        daily_states.append(state)
     
     # 构建提示
     prompt = f"""# Role
@@ -189,7 +200,12 @@ You are an expert futures trading agent. Your task is to make trading decisions 
 # Objective
 Analyze the market state for each day in the trajectory and decide on trading positions. You should consider:
 - Price trends and historical context
-- Technical indicators (normalized returns, volatility, RSI, MACD) for each day
+- Technical indicators (normalized returns, volatility, RSI, MACD) for each day"""
+
+    if use_sentiment:
+        prompt += "\n- Daily sentiment indicator : positive values represent bullish, negative values represent bearish, and the absolute value represents the intensity of the sentiment."
+
+    prompt += f"""
 - Risk management through position sizing
 - Sequential decision-making: each day's decision should consider previous days' market conditions
 
@@ -207,8 +223,11 @@ Analyze the market state for each day in the trajectory and decide on trading po
   Normalized Return (30 days): {state['norm_return_30']:.4f}
   RSI (30-day): {state['rsi']:.2f}
   MACD (16-48): {state['macd']:.4f}
-
 """
+        if use_sentiment:
+            prompt += f"  Sentiment: {state['sent_1']:.2f}\n"
+
+        prompt += "\n"
     
     prompt += f"""# Output Format
 You must strictly output a valid JSON object following the structure below:
@@ -348,7 +367,7 @@ def generate_answer_ground_truth_trajectory(df: pd.DataFrame, start_idx: int,
     ground_truth = {
         "sequence_id": "RB0.SHF",  # 序列标识符
         "trajectory_start_idx": int(start_idx),  # 轨迹起始索引
-        "time_stamp": trajectory_df.iloc[2]['时间'],
+        "time_stamp": str(trajectory_df.iloc[2]['时间']),  # Timestamp 需转为 str 才能 JSON 序列化
         "trajectory_length": int(trajectory_length),  # 轨迹长度
         "prices": [float(p) for p in prices],  # 价格序列（trajectory_length + 1 个值）
         "volatilities": [float(v) for v in volatilities],  # 波动率序列（trajectory_length 个值）
@@ -369,7 +388,8 @@ def generate_dataset(excel_path: str, output_dir: str,
                      min_valid_features: int = 60,
                      train_ratio: float = 0.9,
                      trajectory_stride: int = 1,
-                     aug_times: int = 1):
+                     aug_times: int = 1,
+                     use_sentiment: bool = False):
     """
     生成轨迹级别的数据集，并按比例划分为训练集和测试集
     
@@ -384,6 +404,7 @@ def generate_dataset(excel_path: str, output_dir: str,
                          如果设为trajectory_length，则轨迹之间不重叠
         aug_times: 数据增广倍数（默认1，即不增广）。如果 > 1，会对每个样本生成 aug_times 个变体，
                    价格在 [0.95, 1.05] 范围内随机缩放。
+        use_sentiment: 是否在prompt中加入情绪指标
     """
     # 加载数据
     print(f"加载数据从: {excel_path}")
@@ -456,7 +477,8 @@ def generate_dataset(excel_path: str, output_dir: str,
                         df, idx, 
                         trajectory_length=trajectory_length,
                         lookback_window=lookback_window,
-                        price_scale=price_scale
+                        price_scale=price_scale,
+                        use_sentiment=use_sentiment
                     )
                     
                     # 生成轨迹级别的 ground truth
@@ -518,10 +540,10 @@ def generate_dataset(excel_path: str, output_dir: str,
 
 if __name__ == "__main__":
     # 配置路径和参数
-    output_dir = "./data"
+    # output_dir = "./data"
     excel_path = "./data/RB0.SHF.xlsx"
-    # output_dir = "/home/tione/notebook/workspace/xiaoyangchen/work/data/guba"
-    import ipdb; ipdb.set_trace()
+    output_dir = "/home/tione/notebook/workspace/xiaoyangchen/work/data/guba"
+    
     # 生成轨迹级别数据集
     generate_dataset(
         excel_path=excel_path,
@@ -531,7 +553,8 @@ if __name__ == "__main__":
         min_valid_features=62,  # 最少需要的有效特征数量
         train_ratio=0.9,  # 9:1 划分训练集和测试集
         trajectory_stride=1,  # 轨迹滑动步长
-        aug_times=5  # 数据增广：每个样本生成5个变体（1个原始 + 4个随机缩放）
+        aug_times=5,  # 数据增广：每个样本生成5个变体（1个原始 + 4个随机缩放）
+        use_sentiment=True  # 是否在prompt中加入情绪指标
         # 注意：volatility_target 和 transaction_cost_bp 使用 reward 函数的默认值
         # 如需自定义，可在 reward 函数中设置或通过配置文件传递
     )
